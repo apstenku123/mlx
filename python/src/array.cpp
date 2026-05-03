@@ -15,6 +15,7 @@
 #include "mlx/utils.h"
 #include "python/src/buffer.h"
 #include "python/src/convert.h"
+#include "python/src/dlpack_consumer.h"
 #include "python/src/indexing.h"
 #include "python/src/small_vector.h"
 #include "python/src/utils.h"
@@ -279,6 +280,34 @@ void init_array(nb::module_& m) {
       )pbdoc")
       .def("__next__", &ArrayPythonIterator::next)
       .def("__iter__", [](const ArrayPythonIterator& it) { return it; });
+
+  m.def(
+      "from_dlpack",
+      [](nb::object obj) { return dlpack_to_mlx(obj); },
+      "obj"_a,
+      R"pbdoc(
+        Build an :class:`array` from a DLPack capsule or any object that
+        implements ``__dlpack__()``.
+
+        For ``device_type == kDLCPU`` the bytes are copied into a fresh MLX
+        allocation. For ``device_type == kDLMetal`` the foreign ``MTLBuffer``
+        is wrapped without copying; the buffer must use
+        ``MTLStorageModeShared`` so MLX can read and write it. Other DLPack
+        device types raise an exception.
+
+        The returned array takes over the capsule's lifecycle: the producer's
+        deleter is invoked exactly once, after the wrapping array (and any
+        aliases) are destroyed.
+
+        Args:
+            obj: a DLPack ``PyCapsule`` (named ``"dltensor"`` or
+                ``"dltensor_versioned"``) or a Python object with a
+                ``__dlpack__()`` method.
+
+        Returns:
+            array: an MLX array sharing memory with the producer when
+                possible.
+      )pbdoc");
 
   // Install buffer protocol functions
   PyType_Slot array_slots[] = {
