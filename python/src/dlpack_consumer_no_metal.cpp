@@ -6,10 +6,7 @@
 
 mx::array build_dlpack_metal_array(
     nb::dlpack::dltensor& /*t*/,
-    std::shared_ptr<DLPackOwner> owner) {
-  // Drive the producer's deleter so we don't leak its allocation.
-  if (owner)
-    owner->invoke();
+    std::shared_ptr<DLPackOwner> /*owner*/) {
   throw std::invalid_argument(
       "[from_dlpack] MLX was built without Metal support; cannot consume "
       "kDLMetal capsules.");

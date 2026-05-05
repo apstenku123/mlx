@@ -23,6 +23,7 @@ trip the private-mode guard.
 from __future__ import annotations
 
 import unittest
+import ctypes
 
 import numpy as np
 
@@ -61,6 +62,48 @@ class TestFromDLPackBasic(unittest.TestCase):
         y = mx.from_dlpack(x)
         # Different arrays, same data
         self.assertTrue(mx.array_equal(x, y).item())
+
+    def test_mx_array_accepts_dlpack_producer(self):
+        class DLPackProducer:
+            def __init__(self, array):
+                self.array = array
+
+            def __dlpack__(self):
+                return self.array.__dlpack__()
+
+            def __dlpack_device__(self):
+                return self.array.__dlpack_device__()
+
+        arr_np = np.arange(12, dtype=np.float32).reshape(3, 4)
+        arr_mx = mx.array(DLPackProducer(arr_np))
+        self.assertEqual(tuple(arr_mx.shape), (3, 4))
+        self.assertEqual(arr_mx.dtype, mx.float32)
+        self.assertTrue(np.allclose(np.asarray(arr_mx), arr_np))
+
+    def test_mx_array_accepts_dlpack_capsule(self):
+        arr_np = np.arange(8, dtype=np.int32).reshape(2, 4)
+        arr_mx = mx.array(arr_np.__dlpack__())
+        self.assertEqual(tuple(arr_mx.shape), (2, 4))
+        self.assertEqual(arr_mx.dtype, mx.int32)
+        self.assertTrue(np.array_equal(np.asarray(arr_mx), arr_np))
+
+    def test_mx_array_dlpack_dtype_override(self):
+        arr_np = np.arange(6, dtype=np.int32).reshape(2, 3)
+        arr_mx = mx.array(arr_np.__dlpack__(), dtype=mx.float32)
+        self.assertEqual(arr_mx.dtype, mx.float32)
+        self.assertTrue(np.array_equal(np.asarray(arr_mx), arr_np.astype(np.float32)))
+
+    def test_mx_array_prefers_mlx_array_protocol_over_dlpack(self):
+        class BothProtocols:
+            def __mlx_array__(self):
+                return mx.array([1, 2, 3], dtype=mx.int32)
+
+            def __dlpack__(self):
+                raise AssertionError("__dlpack__ should not be called")
+
+        arr_mx = mx.array(BothProtocols())
+        self.assertEqual(arr_mx.dtype, mx.int32)
+        self.assertTrue(np.array_equal(np.asarray(arr_mx), np.array([1, 2, 3])))
 
     def test_dtypes(self):
         cases = [
@@ -122,6 +165,24 @@ class TestFromDLPackNonContiguous(unittest.TestCase):
             )
         with self.assertRaises(Exception):
             mx.from_dlpack(capsule)
+
+    def test_rejected_capsule_is_not_marked_used(self):
+        big = np.arange(16, dtype=np.float32).reshape(4, 4)
+        view = big[::2, :]
+        try:
+            capsule = view.__dlpack__()
+        except (TypeError, BufferError):
+            self.skipTest(
+                "NumPy refused to export a non-contiguous DLPack capsule"
+            )
+
+        with self.assertRaises(Exception):
+            mx.from_dlpack(capsule)
+
+        get_name = ctypes.pythonapi.PyCapsule_GetName
+        get_name.argtypes = [ctypes.py_object]
+        get_name.restype = ctypes.c_char_p
+        self.assertEqual(get_name(capsule), b"dltensor")
 
 
 if __name__ == "__main__":

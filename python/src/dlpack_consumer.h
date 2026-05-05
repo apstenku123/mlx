@@ -1,12 +1,14 @@
 // Copyright © 2026 Apple Inc.
 #pragma once
 
+#include <cstddef>
 #include <memory>
 
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
 
 #include "mlx/array.h"
+#include "mlx/dtype.h"
 
 namespace mx = mlx::core;
 namespace nb = nanobind;
@@ -21,19 +23,30 @@ namespace nb = nanobind;
 //
 // All other device types raise std::invalid_argument.
 //
-// The returned mx::array takes ownership of the capsule's deleter. Once the
-// array (and any aliases) are destroyed, the capsule's deleter is invoked
-// exactly once.
+// kDLCPU input is copied into a fresh MLX allocation and the capsule deleter is
+// invoked before return. kDLMetal input is wrapped zero-copy, so the returned
+// mx::array keeps the capsule deleter alive until the array and any aliases are
+// destroyed. Rejected capsules are left unconsumed.
 mx::array dlpack_to_mlx(nb::object obj);
 
+mx::Dtype dlpack_to_mlx_dtype(const nb::dlpack::dtype& dt);
+mx::Shape validate_and_extract_shape(const nb::dlpack::dltensor& t);
+bool is_row_contiguous(const mx::Shape& shape, const int64_t* strides);
+size_t checked_num_bytes(const mx::Shape& shape, mx::Dtype dtype);
+
 // A small reference-counted holder that drives the DLPack capsule's deleter
-// exactly once. Kept here so the metal-glue translation unit can reach it.
+// exactly once after ownership has been committed. Kept here so the metal-glue
+// translation unit can reach it.
 class DLPackOwner {
  public:
   DLPackOwner(bool versioned, void* mt) : versioned_(versioned), mt_(mt) {}
 
   ~DLPackOwner() {
     invoke();
+  }
+
+  void activate() {
+    active_ = true;
   }
 
   void invoke();
@@ -45,6 +58,7 @@ class DLPackOwner {
  private:
   bool versioned_;
   void* mt_;
+  bool active_ = false;
 };
 
 // Build an mx::array from a DLPack tensor whose data is a foreign MTL::Buffer.

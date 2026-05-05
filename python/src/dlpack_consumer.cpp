@@ -3,15 +3,15 @@
 #include "python/src/dlpack_consumer.h"
 
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <sstream>
+#include <stdexcept>
 
 #include "mlx/allocator.h"
 #include "mlx/dtype.h"
 #include "python/src/convert.h"
 #include "python/src/dlpack_format.h"
-
-namespace {
 
 mx::Dtype dlpack_to_mlx_dtype(const nb::dlpack::dtype& dt) {
   if (dt.lanes != 1) {
@@ -77,22 +77,67 @@ mx::Dtype dlpack_to_mlx_dtype(const nb::dlpack::dtype& dt) {
   throw std::invalid_argument(msg.str());
 }
 
-bool is_row_contiguous(
-    int32_t ndim,
-    const int64_t* shape,
-    const int64_t* strides) {
+mx::Shape validate_and_extract_shape(const nb::dlpack::dltensor& t) {
+  if (t.ndim < 0) {
+    throw std::invalid_argument("[from_dlpack] ndim must be non-negative.");
+  }
+  if (t.ndim > 0 && t.shape == nullptr) {
+    throw std::invalid_argument(
+        "[from_dlpack] shape must not be null when ndim > 0.");
+  }
+  mx::Shape shape;
+  shape.reserve(t.ndim);
+  for (int i = 0; i < t.ndim; ++i) {
+    if (t.shape[i] < 0) {
+      throw std::invalid_argument(
+          "[from_dlpack] shape dims must be non-negative.");
+    }
+    if (t.shape[i] > std::numeric_limits<int32_t>::max()) {
+      throw std::invalid_argument(
+          "[from_dlpack] shape dim exceeds int32 range.");
+    }
+    shape.push_back(static_cast<int32_t>(t.shape[i]));
+  }
+  return shape;
+}
+
+bool is_row_contiguous(const mx::Shape& shape, const int64_t* strides) {
   if (strides == nullptr) {
     return true;
   }
   int64_t expected = 1;
-  for (int i = ndim - 1; i >= 0; --i) {
+  for (int i = static_cast<int>(shape.size()) - 1; i >= 0; --i) {
     if (strides[i] != expected) {
+      return false;
+    }
+    if (shape[i] != 0 &&
+        expected > std::numeric_limits<int64_t>::max() / shape[i]) {
       return false;
     }
     expected *= shape[i];
   }
   return true;
 }
+
+size_t checked_num_bytes(const mx::Shape& shape, mx::Dtype dtype) {
+  size_t nelems = 1;
+  for (auto dim : shape) {
+    if (dim != 0 &&
+        nelems >
+            std::numeric_limits<size_t>::max() / static_cast<size_t>(dim)) {
+      throw std::invalid_argument(
+          "[from_dlpack] shape element count overflows size_t.");
+    }
+    nelems *= static_cast<size_t>(dim);
+  }
+  if (dtype.size() != 0 &&
+      nelems > std::numeric_limits<size_t>::max() / dtype.size()) {
+    throw std::invalid_argument("[from_dlpack] tensor byte size overflows.");
+  }
+  return nelems * dtype.size();
+}
+
+namespace {
 
 struct ParsedCapsule {
   PyObject* capsule = nullptr;
@@ -131,30 +176,18 @@ ParsedCapsule parse_capsule(PyObject* obj) {
   return out;
 }
 
-void rename_capsule_after_take(PyObject* capsule, bool versioned) {
-  const char* used =
-      versioned ? "used_dltensor_versioned" : "used_dltensor";
-  PyCapsule_SetName(capsule, used);
-  PyCapsule_SetDestructor(capsule, nullptr);
-}
-
-mx::Shape extract_shape(const nb::dlpack::dltensor& t) {
-  mx::Shape shape;
-  shape.reserve(t.ndim);
-  for (int i = 0; i < t.ndim; ++i) {
-    if (t.shape[i] > std::numeric_limits<int32_t>::max()) {
-      throw std::invalid_argument(
-          "[from_dlpack] shape dim exceeds int32 range.");
-    }
-    shape.push_back(static_cast<int32_t>(t.shape[i]));
+void mark_capsule_consumed(PyObject* capsule, bool versioned) {
+  const char* used = versioned ? "used_dltensor_versioned" : "used_dltensor";
+  if (PyCapsule_SetName(capsule, used) != 0 ||
+      PyCapsule_SetDestructor(capsule, nullptr) != 0) {
+    PyErr_Clear();
+    throw std::runtime_error(
+        "[from_dlpack] failed to mark DLPack capsule as consumed.");
   }
-  return shape;
 }
 
-mx::array build_cpu_array(
-    nb::dlpack::dltensor& t,
-    std::shared_ptr<DLPackOwner> owner) {
-  if (!is_row_contiguous(t.ndim, t.shape, t.strides)) {
+mx::array build_cpu_array(nb::dlpack::dltensor& t, const mx::Shape& shape) {
+  if (!is_row_contiguous(shape, t.strides)) {
     throw std::invalid_argument(
         "[from_dlpack] non-row-contiguous DLPack strides are not supported "
         "for kDLCPU tensors yet.");
@@ -164,34 +197,30 @@ mx::array build_cpu_array(
         "[from_dlpack] kDLCPU capsule with non-zero byte_offset is not "
         "supported yet.");
   }
-  auto shape = extract_shape(t);
   auto dtype = dlpack_to_mlx_dtype(t.dtype);
-
-  size_t nelems = 1;
-  for (int i = 0; i < t.ndim; ++i)
-    nelems *= static_cast<size_t>(t.shape[i]);
-  size_t nbytes = nelems * dtype.size();
+  size_t nbytes = checked_num_bytes(shape, dtype);
+  if (nbytes > 0 && t.data == nullptr) {
+    throw std::invalid_argument(
+        "[from_dlpack] kDLCPU capsule has null data pointer.");
+  }
 
   // Allocate a fresh mlx buffer and copy the producer's bytes in. This
   // mirrors the semantics of nd_array_to_mlx_contiguous for the kDLCPU
   // path. We use the (allocator::Buffer, Shape, Dtype, Deleter) overload to
   // get an array whose status() == Status::available immediately.
   auto buffer = mx::allocator::malloc(nbytes);
-  std::memcpy(
-      static_cast<uint8_t*>(buffer.raw_ptr()),
-      t.data,
-      nbytes);
-  mx::array out(buffer, std::move(shape), dtype, mx::allocator::free);
+  if (nbytes > 0) {
+    std::memcpy(static_cast<uint8_t*>(buffer.raw_ptr()), t.data, nbytes);
+  }
+  mx::array out(buffer, shape, dtype, mx::allocator::free);
 
-  // Done with the producer; bytes are copied.
-  owner->invoke();
   return out;
 }
 
 } // namespace
 
 void DLPackOwner::invoke() {
-  if (mt_ == nullptr)
+  if (!active_ || mt_ == nullptr)
     return;
   if (versioned_) {
     auto* m = static_cast<dlpack_format::DLManagedTensorVersioned*>(mt_);
@@ -203,6 +232,7 @@ void DLPackOwner::invoke() {
       m->deleter(m);
   }
   mt_ = nullptr;
+  active_ = false;
 }
 
 mx::array dlpack_to_mlx(nb::object obj) {
@@ -235,15 +265,25 @@ mx::array dlpack_to_mlx(nb::object obj) {
   }
 
   ParsedCapsule p = parse_capsule(raw);
-  auto owner = std::make_shared<DLPackOwner>(p.versioned, p.managed);
-  rename_capsule_after_take(p.capsule, p.versioned);
-
   auto& t = *p.tensor;
+  auto shape = validate_and_extract_shape(t);
+
   switch (t.device.device_type) {
-    case dlpack_format::kDLCPU:
-      return build_cpu_array(t, owner);
-    case dlpack_format::kDLMetal:
-      return build_dlpack_metal_array(t, owner);
+    case dlpack_format::kDLCPU: {
+      auto owner = std::make_shared<DLPackOwner>(p.versioned, p.managed);
+      auto out = build_cpu_array(t, shape);
+      mark_capsule_consumed(p.capsule, p.versioned);
+      owner->activate();
+      owner->invoke();
+      return out;
+    }
+    case dlpack_format::kDLMetal: {
+      auto owner = std::make_shared<DLPackOwner>(p.versioned, p.managed);
+      auto out = build_dlpack_metal_array(t, owner);
+      mark_capsule_consumed(p.capsule, p.versioned);
+      owner->activate();
+      return out;
+    }
     case dlpack_format::kDLCUDA:
       throw std::invalid_argument(
           "[from_dlpack] kDLCUDA tensors are not supported by MLX. Move the "
